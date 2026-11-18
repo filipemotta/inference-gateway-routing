@@ -176,7 +176,8 @@ fresh_model_servers() {
   k -n "${NS}" rollout status deploy/model-server --timeout=180s >/dev/null
   # rollout status returns when the new pods are Ready; wait for the old ones
   # to be gone so the pod list (and the metrics we read) is the new set.
-  # shellcheck disable=SC2329 # called through wait_until
+  # SC2329 (0.10+) and SC2317 (0.9, the ubuntu-24.04 runner): called through wait_until
+  # shellcheck disable=SC2329,SC2317
   three_pods() { [ "$(k -n "${NS}" get pods -l app=model-server --no-headers 2>/dev/null | wc -l | tr -d ' ')" = 3 ]; }
   wait_until 120 three_pods
 }

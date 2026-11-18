@@ -138,8 +138,11 @@ expect_true_if "FailOpen: conversations spread again ($(jq -r .open.pods_per_con
   .open.pods_per_conversation_mean '.open.pods_per_conversation_mean >= 2.5' "${O}"
 expect_perf "FailOpen: prefix cache hit rate back to baseline ($(jq -r .open.prefix_hit_rate <<< "${O}") vs $(jq -r .pool.prefix_hit_rate <<< "${O}") with the picker)" \
   '.open.prefix_hit_rate <= .pool.prefix_hit_rate - 0.15' "${O}"
-expect_perf "FailOpen: TTFT p50 back above the picker's ($(jq -r .open.ttft_ms.p50 <<< "${O}") ms vs $(jq -r .pool.ttft_ms.p50 <<< "${O}") ms)" \
-  '.open.ttft_ms.p50 >= 1.5 * .pool.ttft_ms.p50' "${O}"
+# Mean, not p50: with the hit rate near 0.5 the TTFT distribution has two
+# modes (warm cache near 80 ms, cold prefill near 500 ms) and the median lands
+# on either one from run to run.
+expect_perf "FailOpen: mean TTFT back above the picker's ($(jq -r .open.ttft_ms.mean <<< "${O}") ms vs $(jq -r .pool.ttft_ms.mean <<< "${O}") ms)" \
+  '.open.ttft_ms.mean >= 1.3 * .pool.ttft_ms.mean' "${O}"
 expect_match "InferencePool status still Accepted and ResolvedRefs" 'Accepted=True ResolvedRefs=True' "${open_conditions}"
 expect_eq "restored: gateway Envoy back to failure_mode_allow false" "false" "$(envoy_failure_mode_allow)"
 expect_eq "restored: every request answered through the picker" '{"200":20}' "$(jq -c .statuses "${OUT}/04c-restored.json")"
