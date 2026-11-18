@@ -1,0 +1,17 @@
+# istiod 1.32.0 (Helm chart istio/istiod) for the lab.
+# ENABLE_GATEWAY_API_INFERENCE_EXTENSION turns on InferencePool support: with
+# it off, an HTTPRoute pointing at an InferencePool is rejected ("InferencePool
+# is not enabled"). Access logs on stdout so the gateway's view of every
+# request (status, response flags) can be read in its pod logs.
+pilot:
+  env:
+    ENABLE_GATEWAY_API_INFERENCE_EXTENSION: "true"
+  autoscaleEnabled: false
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  nodeSelector:
+    lab.infergw/role: platform
+meshConfig:
+  accessLogFile: /dev/stdout

@@ -1,0 +1,15 @@
+bin/
+out/
+*.log
+.DS_Store
+# Terraform (eks/)
+.terraform/
+.terraform.lock.hcl.bak
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+*.tfvars
+!*.tfvars.example
+__pycache__/
+*.pyc

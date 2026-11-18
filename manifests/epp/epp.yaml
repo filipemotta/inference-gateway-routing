@@ -1,0 +1,216 @@
+# The Endpoint Picker (EPP) of llm-d-router v1.0.0, the full-featured EPP that
+# moved out of the Gateway API Inference Extension in its v1.6.0 release.
+# Derived from `helm template` of the llm-d-router-gateway chart v1.0.0
+# (provider istio) with two lab changes: requests sized for a laptop (the
+# chart asks for 8 CPUs and 8 GiB) and the pod pinned to the platform node.
+#
+# Scheduling: the chart's default profile. Every request is scored on each
+# pod by queue depth (weight 2), KV cache utilization (weight 2) and how much
+# of its prompt prefix the pod has likely cached (weight 3); the highest
+# total wins. The metrics come from each pod's /metrics (vLLM names).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: model-server-epp
+  namespace: llm
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-server-epp
+  namespace: llm
+data:
+  default-plugins.yaml: |
+    apiVersion: llm-d.ai/v1
+    kind: EndpointPickerConfig
+    plugins:
+    - type: queue-scorer
+    - type: kv-cache-utilization-scorer
+    - type: prefix-cache-scorer
+    - type: metrics-data-source
+      parameters:
+        scheme: "http"
+        path: "/metrics"
+        insecureSkipVerify: true
+    - type: core-metrics-extractor
+    schedulingProfiles:
+    - name: default
+      plugins:
+      - pluginRef: queue-scorer
+        weight: 2
+      - pluginRef: kv-cache-utilization-scorer
+        weight: 2
+      - pluginRef: prefix-cache-scorer
+        weight: 3
+---
+# Read the pool and watch its pods; review tokens for the metrics endpoint.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: model-server-epp
+  namespace: llm
+rules:
+- apiGroups: ["inference.networking.k8s.io"]
+  resources: ["inferencepools"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["llm-d.ai"]
+  resources: ["inferenceobjectives", "inferencemodelrewrites"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "watch", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: model-server-epp
+  namespace: llm
+subjects:
+- kind: ServiceAccount
+  name: model-server-epp
+  namespace: llm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: model-server-epp
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: model-server-epp
+rules:
+- apiGroups: ["authentication.k8s.io"]
+  resources: ["tokenreviews"]
+  verbs: ["create"]
+- apiGroups: ["authorization.k8s.io"]
+  resources: ["subjectaccessreviews"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: model-server-epp
+subjects:
+- kind: ServiceAccount
+  name: model-server-epp
+  namespace: llm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: model-server-epp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-server-epp
+  namespace: llm
+spec:
+  selector:
+    app: model-server-epp
+  ports:
+  - name: grpc-ext-proc
+    protocol: TCP
+    port: 9002
+    appProtocol: kubernetes.io/h2c
+  - name: http-metrics
+    protocol: TCP
+    port: 9090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-server-epp
+  namespace: llm
+spec:
+  replicas: 1
+  # The chart's choice: one active replica, replaced at once on rollout.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: model-server-epp
+  template:
+    metadata:
+      labels:
+        app: model-server-epp
+    spec:
+      serviceAccountName: model-server-epp
+      nodeSelector:
+        lab.infergw/role: platform
+      terminationGracePeriodSeconds: 130
+      containers:
+      - name: epp
+        image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v1.0.0@sha256:024188e998f516879f68532016ca24fabca00afbdcc2af9a61b17634e197df2c
+        args:
+        - --pool-name
+        - model-server
+        - --pool-namespace
+        - llm
+        - --pool-group
+        - inference.networking.k8s.io
+        - --zap-encoder
+        - json
+        - --config-file
+        - /config/default-plugins.yaml
+        - --grpc-health-port
+        - "9003"
+        - --tracing=false
+        ports:
+        - name: grpc
+          containerPort: 9002
+        - name: grpc-health
+          containerPort: 9003
+        - name: metrics
+          containerPort: 9090
+        livenessProbe:
+          grpc:
+            port: 9003
+            service: liveness
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          grpc:
+            port: 9003
+            service: readiness
+          periodSeconds: 2
+        lifecycle:
+          preStop:
+            sleep:
+              seconds: 5
+        env:
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            memory: 1Gi
+        volumeMounts:
+        - name: plugins-config
+          mountPath: /config
+      volumes:
+      - name: plugins-config
+        configMap:
+          name: model-server-epp
+---
+# The EPP serves ext_proc over TLS with a self-signed certificate; the
+# gateway's Envoy is told to originate TLS and not verify it (chart default
+# for provider istio).
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: model-server-epp
+  namespace: llm
+spec:
+  host: model-server-epp.llm.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: SIMPLE
+      insecureSkipVerify: true

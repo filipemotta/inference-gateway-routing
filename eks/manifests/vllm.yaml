@@ -1,0 +1,91 @@
+# The model servers on EKS: vLLM v0.32.0 serving Qwen/Qwen2.5-1.5B-Instruct
+# (Apache-2.0, not gated: no Hugging Face token), one replica per GPU node
+# (g5.xlarge, 1x NVIDIA A10G, 24 GB). Same name and labels as the simulator in the kind
+# lab, so the Service, the InferencePool, the Endpoint Picker and the routes
+# are the very same manifests.
+#
+# Defaults kept on purpose: automatic prefix caching on, continuous batching,
+# vLLM's own max-num-seqs. Two lab settings: a context of 8192 tokens, and
+# VLLM_SERVER_DEV_MODE=1, which exposes POST /reset_prefix_cache so every
+# measured run starts with cold caches without reloading the model. Do not
+# expose the dev endpoints in production.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-server
+  namespace: llm
+  labels:
+    app: model-server
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: model-server
+  template:
+    metadata:
+      labels:
+        app: model-server
+    spec:
+      nodeSelector:
+        lab.infergw/role: model
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      # One replica per GPU node.
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: model-server
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34
+        args:
+        - Qwen/Qwen2.5-1.5B-Instruct
+        - --revision=989aa7980e4cf806f80c7fef2b1adb7bc71aa306
+        - --served-model-name=qwen2.5-1.5b
+        - --port=8000
+        - --max-model-len=8192
+        env:
+        - name: VLLM_SERVER_DEV_MODE
+          value: "1"
+        - name: HF_HOME
+          value: /models
+        ports:
+        - name: http
+          containerPort: 8000
+        startupProbe:
+          httpGet:
+            path: /health
+            port: http
+          periodSeconds: 5
+          failureThreshold: 120
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: "2"
+            memory: 8Gi
+            nvidia.com/gpu: "1"
+          limits:
+            memory: 12Gi
+            nvidia.com/gpu: "1"
+        volumeMounts:
+        - name: models
+          mountPath: /models
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: models
+        emptyDir: {}
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi

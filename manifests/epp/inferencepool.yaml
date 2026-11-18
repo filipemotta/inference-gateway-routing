@@ -1,0 +1,22 @@
+# The InferencePool: the backend that replaces the Service. Same pods (same
+# selector), plus a reference to the Endpoint Picker that chooses among them.
+# failureMode is explicit on purpose. The API default is FailClose, but the
+# llm-d-router chart sets FailOpen on the pools it creates, so the mode you get
+# depends on where the pool came from unless you write it down. validate.sh
+# fails on any InferencePool in this repository without it.
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: model-server
+  namespace: llm
+spec:
+  selector:
+    matchLabels:
+      app: model-server
+  targetPorts:
+  - number: 8000
+  endpointPickerRef:
+    name: model-server-epp
+    port:
+      number: 9002
+    failureMode: FailClose

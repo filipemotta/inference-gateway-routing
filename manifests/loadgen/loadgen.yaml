@@ -1,0 +1,35 @@
+# The load generator: a stock Python image with loadgen/loadgen.py mounted
+# from the ConfigMap "loadgen" (created by scripts/00-cluster.sh from the
+# file). The scenarios run it with kubectl exec, so every run is one
+# synchronous command with its output in the lab log.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: loadgen
+  namespace: llm
+  labels:
+    app: loadgen
+spec:
+  nodeSelector:
+    lab.infergw/role: platform
+  containers:
+  - name: loadgen
+    image: python:3.14.10-slim-trixie@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
+    command: ["sleep", "infinity"]
+    env:
+    - name: PYTHONUNBUFFERED
+      value: "1"
+    resources:
+      requests:
+        cpu: 200m
+        memory: 128Mi
+      limits:
+        memory: 512Mi
+    volumeMounts:
+    - name: script
+      mountPath: /loadgen
+  terminationGracePeriodSeconds: 1
+  volumes:
+  - name: script
+    configMap:
+      name: loadgen

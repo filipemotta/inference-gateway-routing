@@ -1,0 +1,6 @@
+# Everything the lab serves lives in one namespace: the model servers, the
+# Endpoint Picker, the InferencePool, the routes and the load generator.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm

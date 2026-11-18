@@ -1,0 +1,30 @@
+# One Istio Gateway (Gateway API) for every route of the lab. Istio deploys
+# the Envoy behind it; ClusterIP because kind has no load balancer and the
+# load generator runs inside the cluster.
+#
+# Istio keeps only a minimal set of Envoy stats. The proxy.istio.io/config
+# annotation under spec.infrastructure (copied by Istio onto the gateway's
+# pods) adds the ext_proc filter's counters, among them streams_failed and
+# failure_mode_allowed, which observability/alerts.yaml alerts on.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: inference-gateway
+  namespace: llm
+  annotations:
+    networking.istio.io/service-type: ClusterIP
+spec:
+  gatewayClassName: istio
+  infrastructure:
+    annotations:
+      proxy.istio.io/config: |
+        proxyStatsMatcher:
+          inclusionRegexps:
+          - ".*ext_proc.*"
+  listeners:
+  - name: http
+    port: 80
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: Same

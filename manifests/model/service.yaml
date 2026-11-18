@@ -1,0 +1,14 @@
+# The plain Kubernetes Service in front of the model servers: the backend
+# the article starts from. kube-proxy picks a pod per connection.
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-server
+  namespace: llm
+spec:
+  selector:
+    app: model-server
+  ports:
+  - name: http
+    port: 8000
+    targetPort: http

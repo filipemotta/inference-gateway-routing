@@ -1,0 +1,77 @@
+# Three replicas of the vLLM simulator (llm-d-inference-sim v1.2.0): no GPU,
+# no weights, but it speaks the vLLM OpenAI API, streams tokens and exposes
+# the vLLM Prometheus metrics the Endpoint Picker reads.
+#
+# Latency profile: the "7-8B model on an L40S-class GPU" row of the
+# simulator's latency reference (docs/latency-profiles.md), so a prompt costs
+# 30 ms + 0.8 ms per uncached token before the first token and every next
+# token costs 30 ms. Prefix-cache hits skip the per-token prefill cost, which
+# is what makes the replica that already saw a prefix the fast one.
+# max-num-seqs 4: each replica runs at most four requests at once; the rest
+# wait in its queue (vllm:num_requests_waiting). time-factor-under-load 2:
+# a full replica is twice as slow per token as an idle one.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-server
+  namespace: llm
+  labels:
+    app: model-server
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: model-server
+  template:
+    metadata:
+      labels:
+        app: model-server
+    spec:
+      nodeSelector:
+        lab.infergw/role: model
+      containers:
+      - name: vmodel-server
+        image: ghcr.io/llm-d/llm-d-inference-sim:v1.2.0@sha256:9992453829c0dea8d120b8e0322bb0e4237cbb3c6d9ea3bdce060410c40c91c9
+        args:
+        - --model=sim-llm
+        - --port=8000
+        - --max-num-seqs=4
+        - --max-model-len=16384
+        - --latency-calculator=per-token
+        - --prefill-overhead=30ms
+        - --prefill-time-per-token=800us
+        - --inter-token-latency=30ms
+        - --time-factor-under-load=2.0
+        - --enable-kvcache
+        - --kv-cache-size=512
+        - --block-size=16
+        env:
+        # POD_NAME makes every response carry x-inference-pod, so the load
+        # generator knows which replica served each request.
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        # Required by the KV cache simulation (it names the ZMQ topic).
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        ports:
+        - name: http
+          containerPort: 8000
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: http
+          periodSeconds: 2
+        resources:
+          requests:
+            cpu: 100m
+            memory: 64Mi
+          limits:
+            memory: 256Mi

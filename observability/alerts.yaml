@@ -1,0 +1,119 @@
+# Prometheus rules for an InferencePool behind an Istio gateway, one alert per
+# way the Endpoint Picker (EPP) can fail you. Plain rule file: load it with
+# rule_files in prometheus.yml, or paste the groups into a PrometheusRule's
+# spec.groups if you run the Prometheus Operator.
+# Unit tests: observability/alerts.test.yaml (promtool test rules).
+#
+# What each rule reads, and where it comes from:
+#   istio_requests_total                    the gateway's Istio standard metric
+#                                           (port 15020, /stats/prometheus)
+#   envoy_http_ext_proc_*                   the gateway's ext_proc counters; Istio
+#                                           only keeps them with the stats matcher
+#                                           set in manifests/gateway/gateway.yaml
+#   up{job="model-server-epp"}              your scrape job for the EPP's metrics
+#                                           port (9090, needs a bearer token allowed
+#                                           to GET the non-resource URL /metrics)
+#   vllm:prefix_cache_*_total,              each model server's /metrics (vLLM and
+#   vllm:time_to_first_token_seconds_*      the simulator use the same names)
+#
+# PARAMETERS to adapt, all marked "PARAMETER" below: the EPP job name, the
+# share of failed requests, the hit-rate drop, the TTFT p99 threshold and the
+# minimum traffic under which a percentile is not trusted.
+groups:
+- name: inference-gateway
+  rules:
+
+  # Prefix-cache hit rate per model: the share of prompt tokens that needed
+  # no prefill (both counters count tokens).
+  - record: model_name:vllm_prefix_cache_hit_ratio:rate5m
+    expr: |
+      sum by (model_name) (rate(vllm:prefix_cache_hits_total[5m]))
+        /
+      sum by (model_name) (rate(vllm:prefix_cache_queries_total[5m]))
+
+  # FailClose: the gateway cannot reach the EPP and answers 500 itself.
+  # Istio names the Service it generates for a pool <pool>-ip-<8 hex digits>
+  # (InferencePoolServiceName in Istio's inferencepool_collection.go), so the
+  # regex selects the routes to InferencePools and leaves plain Services out.
+  # destination_workload="unknown" means no model server was reached: a 500
+  # returned by a model server carries its workload name instead.
+  - alert: InferencePoolRequestsRefusedAtGateway
+    expr: |
+      (
+        sum by (destination_service_namespace, destination_service_name) (
+          rate(istio_requests_total{reporter="source", destination_service_name=~".+-ip-[0-9a-f]{8}", destination_workload="unknown", response_code="500"}[5m])
+        )
+      /
+        sum by (destination_service_namespace, destination_service_name) (
+          rate(istio_requests_total{reporter="source", destination_service_name=~".+-ip-[0-9a-f]{8}"}[5m])
+        )
+      ) > 0.05  # PARAMETER: share of the pool's requests refused at the gateway
+    for: 2m
+    labels:
+      severity: page
+    annotations:
+      summary: "Requests to InferencePool service {{ $labels.destination_service_namespace }}/{{ $labels.destination_service_name }} fail at the gateway with HTTP 500"
+      description: "More than 5% of the requests on the pool's route got a 500 from the gateway without reaching a model server. With failureMode FailClose this is the Endpoint Picker being unreachable: check its pods and the gateway access log (response detail ext_proc_error_...). The InferencePool status stays Accepted and ResolvedRefs meanwhile."
+
+  # FailOpen: the gateway cannot reach the EPP and forwards anyway. Nothing
+  # fails; this counter is the only gateway-side trace ("errors ignored
+  # because of configuration", Envoy ext_proc statistics).
+  - alert: InferencePoolPickerBypassed
+    expr: |
+      sum without (http_conn_manager_prefix) (
+        rate(envoy_http_ext_proc_failure_mode_allowed[5m])
+      ) > 0
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: "The inference gateway forwards requests without the Endpoint Picker"
+      description: "The ext_proc call to the Endpoint Picker fails and failureMode FailOpen lets the request through to an endpoint the gateway picks itself. Users get answers, without prefix-cache or queue-aware routing."
+
+  # The EPP itself: no ready target in its scrape job. absent() covers both
+  # zero targets (the Deployment scaled to zero, every pod gone) and targets
+  # that are down. It also fires if the job is missing or cannot authenticate,
+  # which leaves you just as blind. absent() of a comparison carries no
+  # labels, hence the component label.
+  - alert: EndpointPickerUnavailable
+    expr: |
+      absent(up{job="model-server-epp"} == 1)  # PARAMETER: the EPP's scrape job
+    for: 1m
+    labels:
+      severity: warning
+      component: endpoint-picker
+    annotations:
+      summary: "No Endpoint Picker replica is being scraped successfully"
+      description: "Under FailClose the pool's requests are refused (see InferencePoolRequestsRefusedAtGateway); under FailOpen they are routed without the picker (see InferencePoolPickerBypassed). Either way, routing quality is gone."
+
+  # FailOpen seen from the model servers: the hit rate falls well below its
+  # own recent level while requests keep coming. The baseline is the median of
+  # the previous 6 hours, so a drop that lasts hours still fires and a slow
+  # drift does not. With no requests the ratio is 0/0 (NaN) and compares
+  # false, so an idle model does not fire.
+  - alert: PrefixCacheHitRateDropped
+    expr: |
+      model_name:vllm_prefix_cache_hit_ratio:rate5m
+        < 0.85 * quantile_over_time(0.5, model_name:vllm_prefix_cache_hit_ratio:rate5m[6h] offset 15m)  # PARAMETER: 15% relative drop
+    for: 15m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Prefix-cache hit rate of model {{ $labels.model_name }} fell more than 15% below its 6-hour median"
+      description: "Requests keep arriving but fewer prompt tokens hit a cached prefix. If the queue (vllm:num_requests_waiting) is flat, routing is the suspect: an Endpoint Picker bypassed under FailOpen sends conversations to any replica."
+
+  # What users feel. vLLM's TTFT buckets include 1, 2.5 and 5 seconds; a
+  # threshold on a bucket boundary avoids interpolation inside a wide bucket.
+  - alert: ModelTimeToFirstTokenP99High
+    expr: |
+      histogram_quantile(0.99,
+        sum by (model_name, le) (rate(vllm:time_to_first_token_seconds_bucket[5m]))
+      ) > 2.5  # PARAMETER: TTFT p99 threshold in seconds, from your SLO
+      and on (model_name)
+      sum by (model_name) (rate(vllm:time_to_first_token_seconds_count[5m])) > 0.1  # PARAMETER: minimum requests per second
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "TTFT p99 of model {{ $labels.model_name }} above 2.5 s"
+      description: "One request in a hundred waits more than 2.5 s for its first token. Rising with vllm:num_requests_waiting: add replicas. Rising with a flat queue and a falling prefix-cache hit rate: look at routing."

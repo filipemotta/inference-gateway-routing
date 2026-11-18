@@ -1,0 +1,23 @@
+# Baseline through the gateway: the same Envoy, the plain Service as backend.
+# Envoy balances each request with Istio's default policy (LEAST_REQUEST),
+# which counts in-flight requests but knows nothing about prompts or caches.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: llm-service
+  namespace: llm
+spec:
+  parentRefs:
+  - name: inference-gateway
+  hostnames:
+  - service.llm.lab
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /v1/
+    backendRefs:
+    - name: model-server
+      port: 8000
+    timeouts:
+      request: 300s

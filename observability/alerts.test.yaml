@@ -1,0 +1,300 @@
+# Unit tests for observability/alerts.yaml: promtool test rules alerts.test.yaml
+# Every alert has a bad case where it must fire and healthy or look-alike cases
+# where it must stay silent. The label sets of the gateway series are the ones
+# the lab's gateway exports (scripts/04-epp-down.sh saves them in out/).
+rule_files:
+- alerts.yaml
+
+evaluation_interval: 1m
+# Rates of round numbers can come out one bit off (0.7999999999999999).
+fuzzy_compare: true
+
+tests:
+
+# --- FailClose: requests to the pool refused at the gateway ------------------
+- name: FailClose outage fires, the plain Service route keeps working
+  interval: 1m
+  input_series:
+  # pool route: 1 request/s answered by the model servers for 10 minutes...
+  - series: 'istio_requests_total{reporter="source",destination_service_name="model-server-ip-7ebfbfe8",destination_service_namespace="llm",destination_workload="model-server",response_code="200",response_flags="-"}'
+    values: '0+60x10 600x20'
+  # ...then the EPP is gone: 500 from the gateway, no workload reached
+  - series: 'istio_requests_total{reporter="source",destination_service_name="model-server-ip-7ebfbfe8",destination_service_namespace="llm",destination_workload="unknown",response_code="500",response_flags="-"}'
+    values: '0x10 60+60x19'
+  # the route to the plain Service is fine all along
+  - series: 'istio_requests_total{reporter="source",destination_service_name="model-server",destination_service_namespace="llm",destination_workload="model-server",response_code="200",response_flags="-"}'
+    values: '0+60x30'
+  alert_rule_test:
+  - eval_time: 9m
+    alertname: InferencePoolRequestsRefusedAtGateway
+    exp_alerts: []
+  - eval_time: 15m
+    alertname: InferencePoolRequestsRefusedAtGateway
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        destination_service_namespace: llm
+        destination_service_name: model-server-ip-7ebfbfe8
+      exp_annotations:
+        summary: "Requests to InferencePool service llm/model-server-ip-7ebfbfe8 fail at the gateway with HTTP 500"
+        description: "More than 5% of the requests on the pool's route got a 500 from the gateway without reaching a model server. With failureMode FailClose this is the Endpoint Picker being unreachable: check its pods and the gateway access log (response detail ext_proc_error_...). The InferencePool status stays Accepted and ResolvedRefs meanwhile."
+
+- name: FailClose look-alikes stay silent
+  interval: 1m
+  input_series:
+  # a model server answering 500 through the pool: an application error,
+  # the request reached a workload
+  - series: 'istio_requests_total{reporter="source",destination_service_name="model-server-ip-7ebfbfe8",destination_service_namespace="llm",destination_workload="model-server",response_code="500",response_flags="-"}'
+    values: '0+30x30'
+  - series: 'istio_requests_total{reporter="source",destination_service_name="model-server-ip-7ebfbfe8",destination_service_namespace="llm",destination_workload="model-server",response_code="200",response_flags="-"}'
+    values: '0+30x30'
+  # a plain Service with no healthy upstream: not an InferencePool
+  - series: 'istio_requests_total{reporter="source",destination_service_name="model-server",destination_service_namespace="llm",destination_workload="unknown",response_code="503",response_flags="UH"}'
+    values: '0+60x30'
+  - series: 'istio_requests_total{reporter="source",destination_service_name="checkout",destination_service_namespace="shop",destination_workload="unknown",response_code="500",response_flags="-"}'
+    values: '0+60x30'
+  alert_rule_test:
+  - eval_time: 25m
+    alertname: InferencePoolRequestsRefusedAtGateway
+    exp_alerts: []
+
+- name: FailClose blip shorter than the for clause stays silent
+  interval: 1m
+  input_series:
+  - series: 'istio_requests_total{reporter="source",destination_service_name="model-server-ip-7ebfbfe8",destination_service_namespace="llm",destination_workload="model-server",response_code="200",response_flags="-"}'
+    values: '0+60x30'
+  # 30 refused requests in one minute (an EPP restart), then nothing
+  - series: 'istio_requests_total{reporter="source",destination_service_name="model-server-ip-7ebfbfe8",destination_service_namespace="llm",destination_workload="unknown",response_code="500",response_flags="-"}'
+    values: '0x10 30x20'
+  alert_rule_test:
+  - eval_time: 12m
+    alertname: InferencePoolRequestsRefusedAtGateway
+    exp_alerts: []
+  - eval_time: 20m
+    alertname: InferencePoolRequestsRefusedAtGateway
+    exp_alerts: []
+
+# --- FailOpen: the gateway forwards without the picker ------------------------
+- name: FailOpen, EPP down - picker bypassed and picker unavailable fire
+  interval: 1m
+  input_series:
+  # ext_proc failures let through by failure_mode_allow, 1 per second
+  - series: 'envoy_http_ext_proc_failure_mode_allowed{http_conn_manager_prefix="outbound_0.0.0.0_80",namespace="llm",pod="inference-gateway-istio-0"}'
+    values: '0x10 60+60x19'
+  # the EPP target answers until minute 10, then the pod is gone (no series)
+  - series: 'up{job="model-server-epp",namespace="llm",pod="model-server-epp-0"}'
+    values: '1x10 stale'
+  alert_rule_test:
+  - eval_time: 9m
+    alertname: InferencePoolPickerBypassed
+    exp_alerts: []
+  - eval_time: 9m
+    alertname: EndpointPickerUnavailable
+    exp_alerts: []
+  - eval_time: 15m
+    alertname: InferencePoolPickerBypassed
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        namespace: llm
+        pod: inference-gateway-istio-0
+      exp_annotations:
+        summary: "The inference gateway forwards requests without the Endpoint Picker"
+        description: "The ext_proc call to the Endpoint Picker fails and failureMode FailOpen lets the request through to an endpoint the gateway picks itself. Users get answers, without prefix-cache or queue-aware routing."
+  - eval_time: 15m
+    alertname: EndpointPickerUnavailable
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        component: endpoint-picker
+      exp_annotations:
+        summary: "No Endpoint Picker replica is being scraped successfully"
+        description: "Under FailClose the pool's requests are refused (see InferencePoolRequestsRefusedAtGateway); under FailOpen they are routed without the picker (see InferencePoolPickerBypassed). Either way, routing quality is gone."
+
+- name: EPP target up but failing (down or unauthorized) fires too
+  interval: 1m
+  input_series:
+  - series: 'up{job="model-server-epp",namespace="llm",pod="model-server-epp-0"}'
+    values: '0x10'
+  alert_rule_test:
+  - eval_time: 5m
+    alertname: EndpointPickerUnavailable
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        component: endpoint-picker
+      exp_annotations:
+        summary: "No Endpoint Picker replica is being scraped successfully"
+        description: "Under FailClose the pool's requests are refused (see InferencePoolRequestsRefusedAtGateway); under FailOpen they are routed without the picker (see InferencePoolPickerBypassed). Either way, routing quality is gone."
+
+- name: healthy picker - nothing bypassed, one replica up, another job down
+  interval: 1m
+  input_series:
+  - series: 'envoy_http_ext_proc_failure_mode_allowed{http_conn_manager_prefix="outbound_0.0.0.0_80",namespace="llm",pod="inference-gateway-istio-0"}'
+    values: '0x30'
+  - series: 'envoy_http_ext_proc_streams_failed{http_conn_manager_prefix="outbound_0.0.0.0_80",namespace="llm",pod="inference-gateway-istio-0"}'
+    values: '0+60x30'
+  - series: 'up{job="model-server-epp",namespace="llm",pod="model-server-epp-0"}'
+    values: '1x30'
+  # a second EPP replica that is not Ready / not serving metrics
+  - series: 'up{job="model-server-epp",namespace="llm",pod="model-server-epp-1"}'
+    values: '0x30'
+  - series: 'up{job="something-else"}'
+    values: '0x30'
+  alert_rule_test:
+  - eval_time: 25m
+    alertname: InferencePoolPickerBypassed
+    exp_alerts: []
+  - eval_time: 25m
+    alertname: EndpointPickerUnavailable
+    exp_alerts: []
+
+# --- FailOpen seen from the model servers: prefix-cache hit rate -------------
+- name: hit rate falls from 0.8 to 0.5 while requests continue
+  interval: 1m
+  input_series:
+  # two replicas, 1000 prompt tokens a minute each
+  - series: 'vllm:prefix_cache_queries_total{model_name="sim-llm",pod="a"}'
+    values: '0+1000x480'
+  - series: 'vllm:prefix_cache_queries_total{model_name="sim-llm",pod="b"}'
+    values: '0+1000x480'
+  # 80% cached for 6 hours, then 50%
+  - series: 'vllm:prefix_cache_hits_total{model_name="sim-llm",pod="a"}'
+    values: '0+800x360 288500+500x119'
+  - series: 'vllm:prefix_cache_hits_total{model_name="sim-llm",pod="b"}'
+    values: '0+800x360 288500+500x119'
+  promql_expr_test:
+  - expr: model_name:vllm_prefix_cache_hit_ratio:rate5m
+    eval_time: 5h
+    exp_samples:
+    - labels: 'model_name:vllm_prefix_cache_hit_ratio:rate5m{model_name="sim-llm"}'
+      value: 0.8
+  - expr: model_name:vllm_prefix_cache_hit_ratio:rate5m
+    eval_time: 7h
+    exp_samples:
+    - labels: 'model_name:vllm_prefix_cache_hit_ratio:rate5m{model_name="sim-llm"}'
+      value: 0.5
+  alert_rule_test:
+  - eval_time: 5h
+    alertname: PrefixCacheHitRateDropped
+    exp_alerts: []
+  - eval_time: 6h10m
+    alertname: PrefixCacheHitRateDropped
+    exp_alerts: []
+  - eval_time: 6h30m
+    alertname: PrefixCacheHitRateDropped
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        model_name: sim-llm
+      exp_annotations:
+        summary: "Prefix-cache hit rate of model sim-llm fell more than 15% below its 6-hour median"
+        description: "Requests keep arriving but fewer prompt tokens hit a cached prefix. If the queue (vllm:num_requests_waiting) is flat, routing is the suspect: an Endpoint Picker bypassed under FailOpen sends conversations to any replica."
+
+- name: hit rate look-alikes stay silent - steady, traffic stops, short dip
+  interval: 1m
+  input_series:
+  # steady 0.8
+  - series: 'vllm:prefix_cache_queries_total{model_name="steady"}'
+    values: '0+1000x480'
+  - series: 'vllm:prefix_cache_hits_total{model_name="steady"}'
+    values: '0+800x480'
+  # traffic stops after 6 hours: no requests, nothing to alert on
+  - series: 'vllm:prefix_cache_queries_total{model_name="idle"}'
+    values: '0+1000x360 360000x120'
+  - series: 'vllm:prefix_cache_hits_total{model_name="idle"}'
+    values: '0+800x360 288000x120'
+  # a 10-minute dip to 0.5 (a model server restart), then back to 0.8
+  - series: 'vllm:prefix_cache_queries_total{model_name="dip"}'
+    values: '0+1000x480'
+  - series: 'vllm:prefix_cache_hits_total{model_name="dip"}'
+    values: '0+800x360 288500+500x9 293800+800x110'
+  alert_rule_test:
+  - eval_time: 6h30m
+    alertname: PrefixCacheHitRateDropped
+    exp_alerts: []
+  - eval_time: 7h30m
+    alertname: PrefixCacheHitRateDropped
+    exp_alerts: []
+
+# --- TTFT p99 ------------------------------------------------------------------
+- name: TTFT p99 above 2.5 s with 3% of requests in the 2.5-5 s bucket
+  interval: 1m
+  input_series:
+  # 10 requests per second; 97% under 0.5 s, 3% between 2.5 and 5 s
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="sim-llm",le="0.25"}'
+    values: '0+300x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="sim-llm",le="0.5"}'
+    values: '0+582x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="sim-llm",le="1"}'
+    values: '0+582x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="sim-llm",le="2.5"}'
+    values: '0+582x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="sim-llm",le="5"}'
+    values: '0+600x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="sim-llm",le="+Inf"}'
+    values: '0+600x30'
+  - series: 'vllm:time_to_first_token_seconds_count{model_name="sim-llm"}'
+    values: '0+600x30'
+  alert_rule_test:
+  - eval_time: 8m
+    alertname: ModelTimeToFirstTokenP99High
+    exp_alerts: []
+  - eval_time: 25m
+    alertname: ModelTimeToFirstTokenP99High
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        model_name: sim-llm
+      exp_annotations:
+        summary: "TTFT p99 of model sim-llm above 2.5 s"
+        description: "One request in a hundred waits more than 2.5 s for its first token. Rising with vllm:num_requests_waiting: add replicas. Rising with a flat queue and a falling prefix-cache hit rate: look at routing."
+
+- name: TTFT look-alikes stay silent - healthy, slow tail under 1%, low traffic
+  interval: 1m
+  input_series:
+  # healthy: everything under 0.5 s
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="healthy",le="0.25"}'
+    values: '0+300x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="healthy",le="0.5"}'
+    values: '0+600x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="healthy",le="1"}'
+    values: '0+600x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="healthy",le="2.5"}'
+    values: '0+600x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="healthy",le="5"}'
+    values: '0+600x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="healthy",le="+Inf"}'
+    values: '0+600x30'
+  - series: 'vllm:time_to_first_token_seconds_count{model_name="healthy"}'
+    values: '0+600x30'
+  # 0.5% slow: p99 still lands in the fast buckets
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="tail",le="0.25"}'
+    values: '0+300x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="tail",le="0.5"}'
+    values: '0+597x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="tail",le="1"}'
+    values: '0+597x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="tail",le="2.5"}'
+    values: '0+597x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="tail",le="5"}'
+    values: '0+600x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="tail",le="+Inf"}'
+    values: '0+600x30'
+  - series: 'vllm:time_to_first_token_seconds_count{model_name="tail"}'
+    values: '0+600x30'
+  # 3 requests a minute, one of them slow: a p99 of almost nothing
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="quiet",le="0.5"}'
+    values: '0+2x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="quiet",le="2.5"}'
+    values: '0+2x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="quiet",le="5"}'
+    values: '0+3x30'
+  - series: 'vllm:time_to_first_token_seconds_bucket{model_name="quiet",le="+Inf"}'
+    values: '0+3x30'
+  - series: 'vllm:time_to_first_token_seconds_count{model_name="quiet"}'
+    values: '0+3x30'
+  alert_rule_test:
+  - eval_time: 25m
+    alertname: ModelTimeToFirstTokenP99High
+    exp_alerts: []
